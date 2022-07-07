@@ -1,13 +1,16 @@
+use std::str::FromStr;
 use std::thread;
 use std::time;
 
 use anyhow::Result;
 use bincode::serialize;
+use reqwest;
 use serde_json::json;
 use solana_address_lookup_table_program::{self, state::AddressLookupTable};
 use solana_client::{
     rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig, rpc_request::RpcRequest,
 };
+use solana_sdk::commitment_config::CommitmentLevel;
 use solana_sdk::{
     self,
     address_lookup_table_account::AddressLookupTableAccount,
@@ -21,7 +24,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionEncoding;
 
-const NUMBER_OF_MINTS: usize = 6;
+const NUMBER_OF_MINTS: usize = 9;
 
 use alt_demo::{token_helpers, token_swap_harness};
 
@@ -33,8 +36,7 @@ pub fn main() {
     println!("Create {NUMBER_OF_MINTS} mints and the corresponding ata for the payer");
     let mut token_mints = Vec::new();
 
-    for i in 0..NUMBER_OF_MINTS {
-        println!("Preparing mint{i}...");
+    for _ in 0..NUMBER_OF_MINTS {
         let token_mint_keypair = Keypair::new();
 
         let mut ixs = token_helpers::initialize_mint(
@@ -83,7 +85,7 @@ pub fn main() {
             &payer.pubkey(),
             true,
             spl_token_swap::instruction::Swap {
-                amount_in: 1_000 - i as u64 * 10,
+                amount_in: 1_000 - i as u64 * 10, // Slow decay to account for cpamm formula
                 minimum_amount_out: 0,
             },
             &rpc_client,
@@ -116,7 +118,10 @@ pub fn main() {
         ))
         .unwrap();
 
-    println!("Create account lookup table and put all pool related addresses inside it");
+    println!(
+        "Create account lookup table and put all {} pool related addresses inside it",
+        pool_keys.len()
+    );
     let recent_slot = rpc_client
         .get_slot_with_commitment(CommitmentConfig::finalized())
         .unwrap();
@@ -126,31 +131,44 @@ pub fn main() {
             payer.pubkey(),
             recent_slot,
         );
-    let extend_ix = solana_address_lookup_table_program::instruction::extend_lookup_table(
-        table_pk,
-        payer.pubkey(),
-        Some(payer.pubkey()),
-        pool_keys,
-    );
 
     let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
     rpc_client
-        .send_and_confirm_transaction_with_spinner_and_config(
-            &Transaction::new_signed_with_payer(
-                &[create_ix, extend_ix],
+        .send_and_confirm_transaction(&Transaction::new_signed_with_payer(
+            &[create_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            latest_blockhash,
+        ))
+        .unwrap();
+
+    println!("Loop to extend the address lookup table");
+    let mut signature = Signature::default();
+    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
+    for selected_pool_keys in pool_keys.chunks(20) {
+        let extend_ix = solana_address_lookup_table_program::instruction::extend_lookup_table(
+            table_pk,
+            payer.pubkey(),
+            Some(payer.pubkey()),
+            selected_pool_keys.to_vec(),
+        );
+
+        signature = rpc_client
+            .send_and_confirm_transaction(&Transaction::new_signed_with_payer(
+                &[extend_ix],
                 Some(&payer.pubkey()),
                 &[&payer],
                 latest_blockhash,
-            ),
+            ))
+            .unwrap();
+    }
+    rpc_client
+        .confirm_transaction_with_spinner(
+            &signature,
+            &latest_blockhash,
             CommitmentConfig::finalized(),
-            RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..RpcSendTransactionConfig::default()
-            },
         )
         .unwrap();
-
-    // TODO: prinln!("Loop to extend the address lookup table");
 
     let tx = Transaction::new_signed_with_payer(
         &swap_ixs,
@@ -162,6 +180,7 @@ pub fn main() {
 
     println!("This legacy serialized tx is {} bytes", serialized_tx.len());
 
+    println!("Wait some arbitrary amount of time to please the address lookup table");
     thread::sleep(time::Duration::from_secs(5));
 
     println!("Create multi hop swap going through each pools and show txid");
@@ -174,17 +193,44 @@ pub fn main() {
     );
     let serialized_encoded = base64::encode(serialized_versioned_tx);
     let config = RpcSendTransactionConfig {
-        skip_preflight: true,
+        skip_preflight: false,
+        preflight_commitment: Some(CommitmentLevel::Processed),
         encoding: Some(UiTransactionEncoding::Base64),
         ..RpcSendTransactionConfig::default()
     };
+
     let signature = rpc_client
-        .send::<Signature>(
+        .send::<String>(
             RpcRequest::SendTransaction,
             json!([serialized_encoded, config]),
         )
         .unwrap();
     println!("Multi swap txid: {}", signature);
+    rpc_client
+        .confirm_transaction_with_commitment(
+            &Signature::from_str(signature.as_str()).unwrap(),
+            CommitmentConfig::finalized(),
+        )
+        .unwrap();
+
+    thread::sleep(time::Duration::from_secs(2)); // Not sure why this is required while commitments are compatible
+
+    // We craft our own getTransaction as RpcClient doesn't support v0
+    let client = reqwest::blocking::Client::new();
+    let res = client
+        .post("http://localhost:8899/")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {"encoding": "json", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}
+            ]
+        }))
+        .send()
+        .unwrap();
+    println!("{:?}", res.text().unwrap());
 }
 
 // from https://github.com/solana-labs/solana/blob/10d677a0927b2ca450b784f750477f05ff6afffe/sdk/program/src/message/versions/v0/mod.rs#L209
