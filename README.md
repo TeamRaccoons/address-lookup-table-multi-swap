@@ -2,7 +2,7 @@
 
 Showcases a N swap chain on spl-token-swap
 
-`solana-test-validator --bpf-program SwapsVeCiPHMUAtzQWZw7RjsKjgCjhwU55QGu4U1Szw bins/spl_token_swap.so --reset`
+`solana-test-validator --bpf-program SwapsVeCiPHMUAtzQWZw7RjsKjgCjhwU55QGu4U1Szw bins/spl_token_swap.so --transaction-account-lock-limit 256 --reset`
 
 The spl token swap program binary was dumped from devnet, there is no new deployment of spl token swap on mainnet-beta
 

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::fs;
 use std::str::FromStr;
 use std::thread;
 use std::time;
@@ -24,7 +26,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionEncoding;
 
-const NUMBER_OF_MINTS: usize = 9;
+const NUMBER_OF_MINTS: usize = 26;
 
 use alt_demo::{token_helpers, token_swap_harness};
 
@@ -47,7 +49,7 @@ pub fn main() {
             &rpc_client,
         );
 
-        let (_, create_ata_ix) =
+        let (ata, create_ata_ix) =
             token_helpers::create_ata(&payer, &token_mint_keypair.pubkey(), &payer.pubkey());
         ixs.push(create_ata_ix);
 
@@ -69,7 +71,6 @@ pub fn main() {
         NUMBER_OF_MINTS - 1
     );
     let mut swap_ixs = Vec::new();
-    let mut pool_keys = Vec::new();
     for i in 0..(NUMBER_OF_MINTS - 1) {
         let token_swap_harness = token_swap_harness::initialize_pool(
             &payer,
@@ -91,9 +92,15 @@ pub fn main() {
             &rpc_client,
         );
         swap_ixs.push(ix);
-
-        pool_keys.extend(token_swap_harness.get_keys(&rpc_client));
     }
+
+    // The keys we can store in address lookup tables to reduce transaction size
+    let mut keys = HashSet::new();
+    swap_ixs.iter().for_each(|ix| {
+        ix.accounts.iter().for_each(|account| {
+            keys.insert(account.pubkey);
+        })
+    });
 
     println!("mint some mint0 tokens to swap all the way to mintN");
     let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
@@ -119,8 +126,8 @@ pub fn main() {
         .unwrap();
 
     println!(
-        "Create account lookup table and put all {} pool related addresses inside it",
-        pool_keys.len()
+        "Create account lookup table and put all {} keys inside it",
+        keys.len()
     );
     let recent_slot = rpc_client
         .get_slot_with_commitment(CommitmentConfig::finalized())
@@ -131,6 +138,7 @@ pub fn main() {
             payer.pubkey(),
             recent_slot,
         );
+    println!("address lookup table pk: {}", table_pk);
 
     let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
     rpc_client
@@ -145,7 +153,7 @@ pub fn main() {
     println!("Loop to extend the address lookup table");
     let mut signature = Signature::default();
     let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
-    for selected_pool_keys in pool_keys.chunks(20) {
+    for selected_pool_keys in keys.into_iter().collect::<Vec<Pubkey>>().chunks(20) {
         let extend_ix = solana_address_lookup_table_program::instruction::extend_lookup_table(
             table_pk,
             payer.pubkey(),
@@ -185,7 +193,7 @@ pub fn main() {
 
     println!("Create multi hop swap going through each pools and show txid");
     let versioned_tx =
-        create_tx_with_address_table_lookup(&rpc_client, &swap_ixs, table_pk, &payer).unwrap();
+        create_tx_with_address_lookup_table(&rpc_client, &swap_ixs, table_pk, &payer).unwrap();
     let serialized_versioned_tx = serialize(&versioned_tx).unwrap();
     println!(
         "The serialized versioned tx is {} bytes",
@@ -230,11 +238,18 @@ pub fn main() {
         }))
         .send()
         .unwrap();
-    println!("{:?}", res.text().unwrap());
+    let response_json: serde_json::Value = res.json().unwrap();
+    println!("{:?}", response_json);
+
+    fs::write(
+        "response.json",
+        serde_json::to_string_pretty(&response_json).unwrap(),
+    )
+    .unwrap();
 }
 
 // from https://github.com/solana-labs/solana/blob/10d677a0927b2ca450b784f750477f05ff6afffe/sdk/program/src/message/versions/v0/mod.rs#L209
-fn create_tx_with_address_table_lookup(
+fn create_tx_with_address_lookup_table(
     client: &RpcClient,
     instructions: &[Instruction],
     address_lookup_table_key: Pubkey,
